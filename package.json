@@ -1,0 +1,11 @@
+{
+  "name": "e2b-proxy",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "e2b": "^1.0.0"
+  }
+}

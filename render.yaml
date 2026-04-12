@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: e2b-proxy
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: E2B_API_KEY
+        sync: false
+      - key: PROXY_SECRET
+        value: vocabuquiz-e2b-2026
