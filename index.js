@@ -11,6 +11,20 @@ let lastUsed = 0;
 const SANDBOX_TIMEOUT = 300; // 5 min
 const IDLE_KILL = 120000; // 2 min idle → kill
 
+let playwrightReady = false;
+
+async function ensurePlaywright(sandbox) {
+  if (playwrightReady) return;
+  console.log("[E2B] Installing Playwright chromium (first-time)...");
+  try {
+    await sandbox.commands.run("pip install playwright --quiet && playwright install chromium --with-deps 2>&1 | tail -1", { timeout: 180 });
+    playwrightReady = true;
+    console.log("[E2B] Playwright ready");
+  } catch (e) {
+    console.error("[E2B] Playwright install failed:", e.message);
+  }
+}
+
 async function getSandbox() {
   if (activeSandbox) {
     lastUsed = Date.now();
@@ -22,6 +36,7 @@ async function getSandbox() {
     timeout: SANDBOX_TIMEOUT
   });
   lastUsed = Date.now();
+  playwrightReady = false;
   console.log("[E2B] Sandbox ready:", activeSandbox.sandboxId);
   return activeSandbox;
 }
@@ -114,11 +129,208 @@ const server = createServer(async (req, res) => {
       return jsonResp(res, 200, { ok: true, content });
     }
 
+    /* ── POST /screenshot — Render HTML and capture a PNG screenshot ── */
+    if (req.method === "POST" && path === "/screenshot") {
+      const body = await readBody(req);
+      const html = String(body.html || "");
+      const viewport = body.viewport === "mobile" ? { width: 390, height: 844 } : { width: 1280, height: 800 };
+      const waitMs = Math.min(Number(body.waitMs) || 800, 5000);
+      const fullPage = Boolean(body.fullPage);
+      if (!html) return jsonResp(res, 400, { ok: false, error: "html required" });
+
+      const sandbox = await getSandbox();
+      await ensurePlaywright(sandbox);
+      await sandbox.files.write("/tmp/_app.html", html);
+
+      const script = `
+import asyncio, base64, json, sys
+from playwright.async_api import async_playwright
+async def main():
+    async with async_playwright() as p:
+        b = await p.chromium.launch(args=["--no-sandbox"])
+        ctx = await b.new_context(viewport={"width": ${viewport.width}, "height": ${viewport.height}})
+        page = await ctx.new_page()
+        logs = []
+        page.on("console", lambda msg: logs.append({"type": msg.type, "text": msg.text}))
+        page.on("pageerror", lambda err: logs.append({"type": "error", "text": str(err)}))
+        await page.goto("file:///tmp/_app.html", wait_until="networkidle", timeout=15000)
+        await page.wait_for_timeout(${waitMs})
+        img = await page.screenshot(type="png", full_page=${fullPage ? "True" : "False"})
+        print(json.dumps({"b64": base64.b64encode(img).decode(), "logs": logs[:50]}))
+        await b.close()
+asyncio.run(main())
+`;
+      await sandbox.files.write("/tmp/_screenshot.py", script);
+      const result = await sandbox.commands.run("python3 /tmp/_screenshot.py", { timeout: 30 });
+      if (result.exitCode !== 0) {
+        return jsonResp(res, 500, { ok: false, error: "screenshot failed", stderr: result.stderr });
+      }
+      try {
+        const parsed = JSON.parse(result.stdout);
+        return jsonResp(res, 200, { ok: true, screenshot_base64: parsed.b64, consoleLogs: parsed.logs });
+      } catch (e) {
+        return jsonResp(res, 500, { ok: false, error: "parse failed", stdout: result.stdout.slice(0, 500) });
+      }
+    }
+
+    /* ── POST /console — Run HTML and capture console logs & errors ── */
+    if (req.method === "POST" && path === "/console") {
+      const body = await readBody(req);
+      const html = String(body.html || "");
+      const waitMs = Math.min(Number(body.waitMs) || 1500, 10000);
+      const interactions = Array.isArray(body.interactions) ? body.interactions : [];
+      if (!html) return jsonResp(res, 400, { ok: false, error: "html required" });
+
+      const sandbox = await getSandbox();
+      await ensurePlaywright(sandbox);
+      await sandbox.files.write("/tmp/_app.html", html);
+
+      const interactionCode = interactions.map(i => {
+        if (i.type === "click") return `    try: await page.click(${JSON.stringify(i.selector)}, timeout=2000)\n    except Exception as e: logs.append({"type":"interact_err","text": "click " + ${JSON.stringify(i.selector)} + ": " + str(e)})`;
+        if (i.type === "type") return `    try: await page.fill(${JSON.stringify(i.selector)}, ${JSON.stringify(i.text || "")})\n    except Exception as e: logs.append({"type":"interact_err","text": "type " + ${JSON.stringify(i.selector)} + ": " + str(e)})`;
+        if (i.type === "wait") return `    await page.wait_for_timeout(${Number(i.ms) || 500})`;
+        return "    pass";
+      }).join("\n");
+
+      const script = `
+import asyncio, json
+from playwright.async_api import async_playwright
+async def main():
+    async with async_playwright() as p:
+        b = await p.chromium.launch(args=["--no-sandbox"])
+        page = await b.new_page()
+        logs = []
+        page.on("console", lambda msg: logs.append({"type": msg.type, "text": msg.text[:500]}))
+        page.on("pageerror", lambda err: logs.append({"type": "error", "text": str(err)[:500]}))
+        await page.goto("file:///tmp/_app.html", wait_until="networkidle", timeout=15000)
+        await page.wait_for_timeout(${waitMs})
+${interactionCode || "    pass"}
+        body_text = await page.evaluate("document.body.innerText.slice(0, 2000)")
+        button_count = await page.evaluate("document.querySelectorAll('button').length")
+        input_count = await page.evaluate("document.querySelectorAll('input,textarea,select').length")
+        print(json.dumps({"logs": logs[:100], "bodyText": body_text, "buttons": button_count, "inputs": input_count}))
+        await b.close()
+asyncio.run(main())
+`;
+      await sandbox.files.write("/tmp/_console.py", script);
+      const result = await sandbox.commands.run("python3 /tmp/_console.py", { timeout: 45 });
+      if (result.exitCode !== 0) {
+        return jsonResp(res, 500, { ok: false, error: "console run failed", stderr: result.stderr });
+      }
+      try {
+        const parsed = JSON.parse(result.stdout);
+        return jsonResp(res, 200, { ok: true, ...parsed });
+      } catch {
+        return jsonResp(res, 500, { ok: false, error: "parse failed", stdout: result.stdout.slice(0, 500) });
+      }
+    }
+
+    /* ── POST /test — Run a Playwright test script inline ── */
+    if (req.method === "POST" && path === "/test") {
+      const body = await readBody(req);
+      const html = String(body.html || "");
+      const testScript = String(body.test || "");
+      if (!html || !testScript) return jsonResp(res, 400, { ok: false, error: "html and test required" });
+
+      const sandbox = await getSandbox();
+      await ensurePlaywright(sandbox);
+      await sandbox.files.write("/tmp/_app.html", html);
+
+      const script = `
+import asyncio, json
+from playwright.async_api import async_playwright
+async def main():
+    results = []
+    async with async_playwright() as p:
+        b = await p.chromium.launch(args=["--no-sandbox"])
+        page = await b.new_page()
+        page.on("pageerror", lambda err: results.append({"type": "error", "text": str(err)[:500]}))
+        await page.goto("file:///tmp/_app.html", wait_until="networkidle", timeout=15000)
+        try:
+${testScript.split("\n").map(l => "            " + l).join("\n")}
+            results.append({"type": "pass", "text": "all assertions passed"})
+        except AssertionError as e:
+            results.append({"type": "fail", "text": str(e)[:500]})
+        except Exception as e:
+            results.append({"type": "error", "text": type(e).__name__ + ": " + str(e)[:500]})
+        print(json.dumps({"results": results}))
+        await b.close()
+asyncio.run(main())
+`;
+      await sandbox.files.write("/tmp/_test.py", script);
+      const result = await sandbox.commands.run("python3 /tmp/_test.py", { timeout: 45 });
+      try {
+        const parsed = JSON.parse(result.stdout);
+        const passed = parsed.results.every(r => r.type === "pass");
+        return jsonResp(res, 200, { ok: true, passed, results: parsed.results });
+      } catch {
+        return jsonResp(res, 500, { ok: false, error: "parse failed", stdout: result.stdout.slice(0, 500), stderr: result.stderr.slice(0, 500) });
+      }
+    }
+
+    /* ── POST /search — ripgrep across sandbox files ── */
+    if (req.method === "POST" && path === "/search") {
+      const body = await readBody(req);
+      const pattern = String(body.pattern || "").trim();
+      const searchPath = String(body.path || "/tmp").trim();
+      const maxResults = Math.min(Number(body.maxResults) || 50, 500);
+      if (!pattern) return jsonResp(res, 400, { ok: false, error: "pattern required" });
+
+      const sandbox = await getSandbox();
+      const safePattern = pattern.replace(/'/g, "'\\''");
+      const safePath = searchPath.replace(/'/g, "'\\''");
+      const result = await sandbox.commands.run(
+        `(command -v rg >/dev/null 2>&1 || pip install --quiet ripgrep 2>/dev/null || true); grep -rn --include='*' '${safePattern}' '${safePath}' 2>/dev/null | head -${maxResults}`,
+        { timeout: 20 }
+      );
+      const lines = (result.stdout || "").split("\n").filter(Boolean);
+      return jsonResp(res, 200, { ok: true, matches: lines, count: lines.length });
+    }
+
+    /* ── POST /ls — List directory ── */
+    if (req.method === "POST" && path === "/ls") {
+      const body = await readBody(req);
+      const dirPath = String(body.path || "/tmp").trim();
+      const sandbox = await getSandbox();
+      const result = await sandbox.commands.run(`ls -la '${dirPath.replace(/'/g, "'\\''")}'`, { timeout: 10 });
+      return jsonResp(res, 200, { ok: true, output: result.stdout, stderr: result.stderr });
+    }
+
+    /* ── POST /install — npm/pip install packages ── */
+    if (req.method === "POST" && path === "/install") {
+      const body = await readBody(req);
+      const manager = body.manager === "pip" ? "pip" : "npm";
+      const packages = Array.isArray(body.packages) ? body.packages : [];
+      const cwd = String(body.cwd || "/tmp/app").replace(/'/g, "'\\''");
+      if (!packages.length) return jsonResp(res, 400, { ok: false, error: "packages required" });
+
+      const safePkgs = packages.map(p => String(p).replace(/[^a-zA-Z0-9@/_\-.]/g, "")).filter(Boolean);
+      if (!safePkgs.length) return jsonResp(res, 400, { ok: false, error: "no valid packages" });
+
+      const sandbox = await getSandbox();
+      const cmd = manager === "pip"
+        ? `pip install --quiet ${safePkgs.join(" ")} 2>&1 | tail -20`
+        : `cd '${cwd}' && (test -f package.json || npm init -y >/dev/null) && npm install --silent ${safePkgs.join(" ")} 2>&1 | tail -20`;
+      const result = await sandbox.commands.run(cmd, { timeout: 120 });
+      return jsonResp(res, 200, { ok: result.exitCode === 0, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode });
+    }
+
+    /* ── POST /build — Run build command in cwd ── */
+    if (req.method === "POST" && path === "/build") {
+      const body = await readBody(req);
+      const cwd = String(body.cwd || "/tmp/app").replace(/'/g, "'\\''");
+      const cmd = String(body.command || "npm run build").replace(/[;&|`$]/g, "");
+      const sandbox = await getSandbox();
+      const result = await sandbox.commands.run(`cd '${cwd}' && ${cmd} 2>&1 | tail -100`, { timeout: 180 });
+      return jsonResp(res, 200, { ok: result.exitCode === 0, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode });
+    }
+
     /* ── GET /health ── */
     if (req.method === "GET" && path === "/health") {
       return jsonResp(res, 200, {
         ok: true,
         sandbox: activeSandbox ? activeSandbox.sandboxId : null,
+        playwrightReady,
         uptime: process.uptime()
       });
     }
