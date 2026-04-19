@@ -1,5 +1,6 @@
 import { Sandbox } from "e2b";
 import { createServer } from "http";
+import { JSDOM, VirtualConsole } from "jsdom";
 
 const PORT = process.env.PORT || 3001;
 const PROXY_SECRET = process.env.PROXY_SECRET || "vocabuquiz-e2b-2026";
@@ -177,56 +178,106 @@ asyncio.run(main())
       }
     }
 
-    /* ── POST /console — Run HTML and capture console logs & errors ── */
+    /* ── POST /console — JSDOM-based HTML runtime verification (fast, no sandbox) ── */
     if (req.method === "POST" && path === "/console") {
       const body = await readBody(req);
       const html = String(body.html || "");
-      const waitMs = Math.min(Number(body.waitMs) || 1500, 10000);
-      const interactions = Array.isArray(body.interactions) ? body.interactions : [];
+      const waitMs = Math.min(Math.max(Number(body.waitMs) || 800, 50), 5000);
+      const interactions = Array.isArray(body.interactions) ? body.interactions.slice(0, 20) : [];
       if (!html) return jsonResp(res, 400, { ok: false, error: "html required" });
 
-      const sandbox = await getSandbox();
-      await ensurePlaywright(sandbox);
-      await sandbox.files.write("/home/user/_app.html", html);
+      const logs = [];
+      const vc = new VirtualConsole();
+      vc.on("error", (e) => logs.push({ type: "error", text: String(e?.stack || e?.message || e).slice(0, 500) }));
+      vc.on("warn", (m) => logs.push({ type: "warning", text: String(m).slice(0, 500) }));
+      vc.on("log", (m) => logs.push({ type: "log", text: String(m).slice(0, 500) }));
+      vc.on("info", (m) => logs.push({ type: "info", text: String(m).slice(0, 500) }));
+      vc.on("jsdomError", (e) => logs.push({ type: "error", text: String(e?.message || e).slice(0, 500) }));
 
-      const interactionCode = interactions.map(i => {
-        if (i.type === "click") return `    try: await page.click(${JSON.stringify(i.selector)}, timeout=2000)\n    except Exception as e: logs.append({"type":"interact_err","text": "click " + ${JSON.stringify(i.selector)} + ": " + str(e)})`;
-        if (i.type === "type") return `    try: await page.fill(${JSON.stringify(i.selector)}, ${JSON.stringify(i.text || "")})\n    except Exception as e: logs.append({"type":"interact_err","text": "type " + ${JSON.stringify(i.selector)} + ": " + str(e)})`;
-        if (i.type === "wait") return `    await page.wait_for_timeout(${Number(i.ms) || 500})`;
-        return "    pass";
-      }).join("\n");
-
-      const script = `
-import asyncio, json
-from playwright.async_api import async_playwright
-async def main():
-    async with async_playwright() as p:
-        b = await p.chromium.launch(args=["--no-sandbox"])
-        page = await b.new_page()
-        logs = []
-        page.on("console", lambda msg: logs.append({"type": msg.type, "text": msg.text[:500]}))
-        page.on("pageerror", lambda err: logs.append({"type": "error", "text": str(err)[:500]}))
-        await page.goto("file:///home/user/_app.html", wait_until="networkidle", timeout=15000)
-        await page.wait_for_timeout(${waitMs})
-${interactionCode || "    pass"}
-        body_text = await page.evaluate("document.body.innerText.slice(0, 2000)")
-        button_count = await page.evaluate("document.querySelectorAll('button').length")
-        input_count = await page.evaluate("document.querySelectorAll('input,textarea,select').length")
-        print(json.dumps({"logs": logs[:100], "bodyText": body_text, "buttons": button_count, "inputs": input_count}))
-        await b.close()
-asyncio.run(main())
-`;
-      await sandbox.files.write("/home/user/_console.py", script);
-      const result = await sandbox.commands.run("python3 /home/user/_console.py", { timeout: 45 });
-      if (result.exitCode !== 0) {
-        return jsonResp(res, 500, { ok: false, error: "console run failed", stderr: result.stderr });
-      }
+      let dom;
       try {
-        const parsed = JSON.parse(result.stdout);
-        return jsonResp(res, 200, { ok: true, ...parsed });
-      } catch {
-        return jsonResp(res, 500, { ok: false, error: "parse failed", stdout: result.stdout.slice(0, 500) });
+        dom = new JSDOM(html, {
+          runScripts: "dangerously",
+          resources: "usable",
+          pretendToBeVisual: true,
+          virtualConsole: vc,
+          url: "https://sede.app/",
+        });
+      } catch (e) {
+        return jsonResp(res, 200, { ok: true, logs: [{ type: "error", text: "JSDOM parse failed: " + (e?.message || "") }], bodyText: "", buttons: 0, inputs: 0 });
       }
+
+      const { window } = dom;
+
+      /* Trap window.onerror / unhandledrejection */
+      window.addEventListener("error", (e) => {
+        logs.push({ type: "error", text: String(e?.error?.stack || e?.message || "window error").slice(0, 500) });
+      });
+      window.addEventListener("unhandledrejection", (e) => {
+        logs.push({ type: "error", text: "Unhandled rejection: " + String(e?.reason?.stack || e?.reason || "").slice(0, 500) });
+      });
+
+      /* Wait for scripts to execute + any timers */
+      await new Promise((r) => setTimeout(r, waitMs));
+
+      /* Apply interactions sequentially */
+      for (const it of interactions) {
+        try {
+          if (it.type === "click" && it.selector) {
+            const el = window.document.querySelector(String(it.selector));
+            if (el && typeof el.click === "function") el.click();
+            else logs.push({ type: "interact_err", text: "click: selector not found " + it.selector });
+          } else if (it.type === "type" && it.selector) {
+            const el = window.document.querySelector(String(it.selector));
+            if (el) {
+              el.value = String(it.text || "");
+              try { el.dispatchEvent(new window.Event("input", { bubbles: true })); } catch {}
+              try { el.dispatchEvent(new window.Event("change", { bubbles: true })); } catch {}
+            } else {
+              logs.push({ type: "interact_err", text: "type: selector not found " + it.selector });
+            }
+          } else if (it.type === "wait") {
+            await new Promise((r) => setTimeout(r, Math.min(Number(it.ms) || 200, 3000)));
+          } else if (it.type === "keydown" && it.selector) {
+            const el = window.document.querySelector(String(it.selector));
+            if (el) {
+              const ev = new window.KeyboardEvent("keydown", { key: String(it.key || ""), bubbles: true });
+              el.dispatchEvent(ev);
+            }
+          }
+        } catch (e) {
+          logs.push({ type: "interact_err", text: (it.type || "?") + ": " + String(e?.message || e).slice(0, 300) });
+        }
+      }
+
+      const doc = window.document;
+      let bodyText = "";
+      try {
+        /* Clone body, strip script/style before extracting text to avoid noise */
+        const clone = doc.body?.cloneNode(true);
+        if (clone) {
+          Array.from(clone.querySelectorAll("script,style,noscript")).forEach(n => n.remove());
+          bodyText = String(clone.textContent || "").replace(/\s+/g, " ").trim().slice(0, 2000);
+        }
+      } catch {}
+      const buttons = (doc.querySelectorAll("button") || []).length;
+      const inputs = (doc.querySelectorAll("input,textarea,select") || []).length;
+      const headings = Array.from(doc.querySelectorAll("h1,h2,h3")).slice(0, 10).map(h => (h.tagName.toLowerCase() + ": " + (h.textContent || "").trim().slice(0, 60)));
+      const imgs = (doc.querySelectorAll("img") || []).length;
+      const forms = (doc.querySelectorAll("form") || []).length;
+
+      try { window.close(); } catch {}
+
+      return jsonResp(res, 200, {
+        ok: true,
+        logs: logs.slice(0, 100),
+        bodyText,
+        buttons,
+        inputs,
+        headings,
+        imgs,
+        forms,
+      });
     }
 
     /* ── POST /test — Run a Playwright test script inline ── */
