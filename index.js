@@ -15,9 +15,13 @@ let playwrightReady = false;
 
 async function ensurePlaywright(sandbox) {
   if (playwrightReady) return;
-  console.log("[E2B] Installing Playwright chromium (first-time)...");
+  console.log("[E2B] Installing Playwright chromium + system deps (first-time)...");
   try {
-    await sandbox.commands.run("pip install playwright --quiet && playwright install chromium --with-deps 2>&1 | tail -1", { timeout: 180 });
+    /* pip + chromium (usually already cached), then system libs needed for headless chrome */
+    await sandbox.commands.run("pip install playwright --quiet 2>&1 | tail -1 && playwright install chromium 2>&1 | tail -1", { timeout: 120 });
+    /* chromium system deps — may already be present, best-effort */
+    const depsCmd = "sudo -n apt-get update -qq 2>&1 | tail -1; sudo -n apt-get install -y -qq libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 2>&1 | tail -3";
+    try { await sandbox.commands.run(depsCmd, { timeout: 90 }); } catch (e) { console.warn("[E2B] apt install warn:", e.message); }
     playwrightReady = true;
     console.log("[E2B] Playwright ready");
   } catch (e) {
@@ -339,9 +343,12 @@ asyncio.run(main())
 
   } catch (err) {
     console.error("[E2B] Error:", err.message);
-    /* If sandbox died, reset */
-    if (err.message?.includes("sandbox") || err.message?.includes("not found")) {
+    /* If sandbox died, reset (case-insensitive match for E2B errors like "Sandbox is probably not running") */
+    const _m = String(err.message || "").toLowerCase();
+    if (_m.includes("sandbox") || _m.includes("not found") || _m.includes("deadline_exceeded") || _m.includes("unavailable")) {
+      console.log("[E2B] Resetting sandbox cache due to error");
       activeSandbox = null;
+      playwrightReady = false;
     }
     jsonResp(res, 500, { ok: false, error: err.message || "Internal error" });
   }
