@@ -486,39 +486,41 @@ asyncio.run(main())
         /* Install Flask + any requirements.txt */
         const hasRequirements = Boolean(files["requirements.txt"]);
         installCmd = hasRequirements
-          ? `pip install --quiet -r ${appDir}/requirements.txt 2>&1 | tail -5`
-          : `pip install --quiet flask flask-cors 2>&1 | tail -3`;
+          ? `pip install -r ${appDir}/requirements.txt 2>&1 | tail -10`
+          : `pip install flask flask-cors 2>&1 | tail -5`;
 
         /* Expose LIVE_SERVER_PORT via env var so server can pick it up */
-        startCmd = `cd ${appDir} && PORT=${LIVE_SERVER_PORT} FLASK_APP=${pyEntry} nohup python3 ${pyEntry} > /tmp/server.log 2>&1 &`;
+        startCmd = `cd ${appDir} && (PORT=${LIVE_SERVER_PORT} FLASK_APP=${pyEntry} setsid python3 ${pyEntry} > /tmp/server.log 2>&1 < /dev/null &) ; sleep 0.1 ; echo STARTED`;
       } else if (backend === "express") {
         const jsEntry = files["server.js"] ? "server.js" : "app.js";
         const hasPackageJson = Boolean(files["package.json"]);
         installCmd = hasPackageJson
-          ? `cd ${appDir} && npm install --silent 2>&1 | tail -3`
-          : `cd ${appDir} && npm init -y >/dev/null && npm install --silent express cors 2>&1 | tail -3`;
-        startCmd = `cd ${appDir} && PORT=${LIVE_SERVER_PORT} nohup node ${jsEntry} > /tmp/server.log 2>&1 &`;
+          ? `cd ${appDir} && npm install 2>&1 | tail -5`
+          : `cd ${appDir} && npm init -y >/dev/null && npm install express cors 2>&1 | tail -5`;
+        startCmd = `cd ${appDir} && (PORT=${LIVE_SERVER_PORT} setsid node ${jsEntry} > /tmp/server.log 2>&1 < /dev/null &) ; sleep 0.1 ; echo STARTED`;
       } else {
         /* static fallback */
-        startCmd = `cd ${appDir} && nohup python3 -m http.server ${LIVE_SERVER_PORT} --bind 0.0.0.0 > /tmp/server.log 2>&1 &`;
+        startCmd = `cd ${appDir} && (setsid python3 -m http.server ${LIVE_SERVER_PORT} --bind 0.0.0.0 > /tmp/server.log 2>&1 < /dev/null &) ; sleep 0.1 ; echo STARTED`;
       }
 
-      /* Run install step (if any) */
+      /* Run install step (if any) — generous timeout for first-time installs */
       let installLog = "";
       if (installCmd) {
         try {
-          const ir = await sandbox.commands.run(installCmd, { timeout: 90 });
+          const ir = await sandbox.commands.run(installCmd, { timeout: 180 });
           installLog = (ir.stdout || "") + (ir.stderr ? "\n" + ir.stderr : "");
         } catch (e) {
-          return jsonResp(res, 500, { ok: false, error: "install failed: " + (e?.message || ""), backend });
+          return jsonResp(res, 500, { ok: false, error: "install failed: " + (e?.message || ""), backend, installLog });
         }
       }
 
-      /* Start server */
+      /* Start server — subshell detach ensures commands.run exits immediately */
+      let startLog = "";
       try {
-        await sandbox.commands.run(startCmd, { timeout: 10 });
+        const sr = await sandbox.commands.run(startCmd, { timeout: 15 });
+        startLog = (sr.stdout || "") + (sr.stderr ? "\n" + sr.stderr : "");
       } catch (e) {
-        return jsonResp(res, 500, { ok: false, error: "start failed: " + (e?.message || ""), backend });
+        return jsonResp(res, 500, { ok: false, error: "start failed: " + (e?.message || ""), backend, installLog, startLog });
       }
 
       /* Wait for server to bind + do a health ping via curl */
