@@ -9,8 +9,10 @@ const E2B_API_KEY = process.env.E2B_API_KEY || "";
 /* ═══ Sandbox pool — reuse sandboxes for efficiency ═══ */
 let activeSandbox = null;
 let lastUsed = 0;
-const SANDBOX_TIMEOUT = 300; // 5 min
-const IDLE_KILL = 120000; // 2 min idle → kill
+const SANDBOX_TIMEOUT = 1800; // 30 min (longer for live server sessions)
+const IDLE_KILL = 600000; // 10 min idle → kill (was 2min; live preview needs longer)
+let liveServerRunning = false;
+const LIVE_SERVER_PORT = 8080;
 
 let playwrightReady = false;
 
@@ -42,6 +44,7 @@ async function getSandbox() {
   });
   lastUsed = Date.now();
   playwrightReady = false;
+  liveServerRunning = false;
   console.log("[E2B] Sandbox ready:", activeSandbox.sandboxId);
   return activeSandbox;
 }
@@ -380,12 +383,66 @@ asyncio.run(main())
       return jsonResp(res, 200, { ok: result.exitCode === 0, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode });
     }
 
+    /* ── POST /serve — Live preview server (multi-file support) ── */
+    if (req.method === "POST" && path === "/serve") {
+      const body = await readBody(req);
+      /* files: { "index.html": "...", "style.css": "...", "app.js": "..." } OR just html string */
+      const files = body.files && typeof body.files === "object" ? body.files : null;
+      const singleHtml = String(body.html || "");
+      const entry = String(body.entrypoint || "index.html");
+      if (!files && !singleHtml) return jsonResp(res, 400, { ok: false, error: "files or html required" });
+
+      const sandbox = await getSandbox();
+
+      /* Reset sandbox timeout so live server persists */
+      try { await sandbox.setTimeout(SANDBOX_TIMEOUT); } catch {}
+
+      /* Write files into /home/user/app/ */
+      const appDir = "/home/user/app";
+      await sandbox.commands.run(`rm -rf ${appDir} && mkdir -p ${appDir}`, { timeout: 15 });
+      if (files) {
+        for (const [fname, content] of Object.entries(files)) {
+          const safeFname = String(fname).replace(/\.\.\//g, "").replace(/^\/+/, "");
+          await sandbox.files.write(`${appDir}/${safeFname}`, String(content));
+        }
+      } else {
+        await sandbox.files.write(`${appDir}/${entry}`, singleHtml);
+      }
+
+      /* Start or verify http.server on LIVE_SERVER_PORT */
+      if (!liveServerRunning) {
+        /* Start Python http.server in background, detached from this command */
+        await sandbox.commands.run(
+          `cd ${appDir} && nohup python3 -m http.server ${LIVE_SERVER_PORT} --bind 0.0.0.0 > /tmp/server.log 2>&1 &`,
+          { timeout: 10 }
+        );
+        /* Wait briefly for server to bind */
+        await new Promise((r) => setTimeout(r, 800));
+        liveServerRunning = true;
+      }
+
+      const host = sandbox.getHost(LIVE_SERVER_PORT);
+      const url = (host.startsWith("http") ? host : "https://" + host) + "/" + entry;
+      return jsonResp(res, 200, { ok: true, url, host, port: LIVE_SERVER_PORT, entrypoint: entry });
+    }
+
+    /* ── POST /serve/stop — Stop live server ── */
+    if (req.method === "POST" && path === "/serve/stop") {
+      if (!activeSandbox) return jsonResp(res, 200, { ok: true, stopped: false });
+      try {
+        await activeSandbox.commands.run(`pkill -f 'http.server ${LIVE_SERVER_PORT}' || true`, { timeout: 5 });
+        liveServerRunning = false;
+      } catch (e) {}
+      return jsonResp(res, 200, { ok: true, stopped: true });
+    }
+
     /* ── GET /health ── */
     if (req.method === "GET" && path === "/health") {
       return jsonResp(res, 200, {
         ok: true,
         sandbox: activeSandbox ? activeSandbox.sandboxId : null,
         playwrightReady,
+        liveServerRunning,
         uptime: process.uptime()
       });
     }
