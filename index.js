@@ -394,9 +394,6 @@ asyncio.run(main())
 
       const sandbox = await getSandbox();
 
-      /* Reset sandbox timeout so live server persists */
-      try { await sandbox.setTimeout(SANDBOX_TIMEOUT); } catch {}
-
       /* Write files into /home/user/app/ */
       const appDir = "/home/user/app";
       await sandbox.commands.run(`rm -rf ${appDir} && mkdir -p ${appDir}`, { timeout: 15 });
