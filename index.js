@@ -427,10 +427,128 @@ asyncio.run(main())
     if (req.method === "POST" && path === "/serve/stop") {
       if (!activeSandbox) return jsonResp(res, 200, { ok: true, stopped: false });
       try {
-        await activeSandbox.commands.run(`pkill -f 'http.server ${LIVE_SERVER_PORT}' || true`, { timeout: 5 });
+        await activeSandbox.commands.run(`pkill -f 'http.server ${LIVE_SERVER_PORT}' || true; pkill -f 'python3.*server.py' || true; pkill -f 'python3.*app.py' || true; pkill -f 'node.*server.js' || true`, { timeout: 5 });
         liveServerRunning = false;
       } catch (e) {}
       return jsonResp(res, 200, { ok: true, stopped: true });
+    }
+
+    /* ── POST /serve-fullstack — Full-stack app with backend (Flask/Express) ──
+       Input: { files: { "index.html":..., "server.py":..., "style.css":... },
+                entrypoint: "index.html",
+                backend: "flask" | "express" | "auto" }
+       Output: { ok, url, host, port, backend }                                     */
+    if (req.method === "POST" && path === "/serve-fullstack") {
+      const body = await readBody(req);
+      const files = body.files && typeof body.files === "object" ? body.files : null;
+      if (!files) return jsonResp(res, 400, { ok: false, error: "files map required" });
+
+      const entry = String(body.entrypoint || "index.html");
+      let backend = String(body.backend || "auto");
+
+      /* Auto-detect backend from file list if "auto" */
+      if (backend === "auto") {
+        if (files["server.py"] || files["app.py"] || files["main.py"]) backend = "flask";
+        else if (files["server.js"] || files["app.js"] && files["package.json"]) backend = "express";
+        else backend = "static";
+      }
+
+      const sandbox = await getSandbox();
+      const appDir = "/home/user/app";
+
+      /* Clean + recreate app directory */
+      await sandbox.commands.run(`rm -rf ${appDir} && mkdir -p ${appDir}`, { timeout: 15 });
+
+      /* Write all files */
+      for (const [fname, content] of Object.entries(files)) {
+        const safeFname = String(fname).replace(/\.\.\//g, "").replace(/^\/+/, "");
+        await sandbox.files.write(`${appDir}/${safeFname}`, String(content));
+      }
+
+      /* Stop any previous server */
+      try {
+        await sandbox.commands.run(
+          `pkill -f 'http.server ${LIVE_SERVER_PORT}' || true; pkill -f 'python3.*${appDir}' || true; pkill -f 'node.*${appDir}' || true`,
+          { timeout: 5 }
+        );
+      } catch {}
+      liveServerRunning = false;
+
+      let startCmd = "";
+      let installCmd = "";
+      let pyEntry = "";
+
+      if (backend === "flask") {
+        /* Find Python entrypoint */
+        pyEntry = files["server.py"] ? "server.py" : (files["app.py"] ? "app.py" : (files["main.py"] ? "main.py" : ""));
+        if (!pyEntry) return jsonResp(res, 400, { ok: false, error: "Flask backend requested but no server.py/app.py/main.py found" });
+
+        /* Install Flask + any requirements.txt */
+        const hasRequirements = Boolean(files["requirements.txt"]);
+        installCmd = hasRequirements
+          ? `pip install --quiet -r ${appDir}/requirements.txt 2>&1 | tail -5`
+          : `pip install --quiet flask flask-cors 2>&1 | tail -3`;
+
+        /* Expose LIVE_SERVER_PORT via env var so server can pick it up */
+        startCmd = `cd ${appDir} && PORT=${LIVE_SERVER_PORT} FLASK_APP=${pyEntry} nohup python3 ${pyEntry} > /tmp/server.log 2>&1 &`;
+      } else if (backend === "express") {
+        const jsEntry = files["server.js"] ? "server.js" : "app.js";
+        const hasPackageJson = Boolean(files["package.json"]);
+        installCmd = hasPackageJson
+          ? `cd ${appDir} && npm install --silent 2>&1 | tail -3`
+          : `cd ${appDir} && npm init -y >/dev/null && npm install --silent express cors 2>&1 | tail -3`;
+        startCmd = `cd ${appDir} && PORT=${LIVE_SERVER_PORT} nohup node ${jsEntry} > /tmp/server.log 2>&1 &`;
+      } else {
+        /* static fallback */
+        startCmd = `cd ${appDir} && nohup python3 -m http.server ${LIVE_SERVER_PORT} --bind 0.0.0.0 > /tmp/server.log 2>&1 &`;
+      }
+
+      /* Run install step (if any) */
+      let installLog = "";
+      if (installCmd) {
+        try {
+          const ir = await sandbox.commands.run(installCmd, { timeout: 90 });
+          installLog = (ir.stdout || "") + (ir.stderr ? "\n" + ir.stderr : "");
+        } catch (e) {
+          return jsonResp(res, 500, { ok: false, error: "install failed: " + (e?.message || ""), backend });
+        }
+      }
+
+      /* Start server */
+      try {
+        await sandbox.commands.run(startCmd, { timeout: 10 });
+      } catch (e) {
+        return jsonResp(res, 500, { ok: false, error: "start failed: " + (e?.message || ""), backend });
+      }
+
+      /* Wait for server to bind + do a health ping via curl */
+      await new Promise((r) => setTimeout(r, 2000));
+      let serverOk = false;
+      let serverLog = "";
+      try {
+        const ping = await sandbox.commands.run(
+          `for i in 1 2 3 4 5; do curl -sf -m 2 http://localhost:${LIVE_SERVER_PORT}/ -o /dev/null && { echo "UP"; break; } || sleep 1; done; echo "---LOG---"; tail -20 /tmp/server.log 2>/dev/null`,
+          { timeout: 12 }
+        );
+        serverLog = ping.stdout || "";
+        serverOk = serverLog.includes("UP");
+      } catch {}
+
+      liveServerRunning = serverOk;
+      const host = sandbox.getHost(LIVE_SERVER_PORT);
+      const url = (host.startsWith("http") ? host : "https://" + host) + (backend === "static" ? "/" + entry : "/");
+
+      return jsonResp(res, serverOk ? 200 : 500, {
+        ok: serverOk,
+        url,
+        host,
+        port: LIVE_SERVER_PORT,
+        backend,
+        entrypoint: entry,
+        installLog: installLog.slice(0, 500),
+        serverLog: serverLog.slice(0, 1000),
+        error: serverOk ? null : "server did not respond on port " + LIVE_SERVER_PORT
+      });
     }
 
     /* ── GET /health ── */
