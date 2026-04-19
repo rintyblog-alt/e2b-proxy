@@ -140,7 +140,7 @@ const server = createServer(async (req, res) => {
 
       const sandbox = await getSandbox();
       await ensurePlaywright(sandbox);
-      await sandbox.files.write("/tmp/_app.html", html);
+      await sandbox.files.write("/home/user/_app.html", html);
 
       const script = `
 import asyncio, base64, json, sys
@@ -153,15 +153,15 @@ async def main():
         logs = []
         page.on("console", lambda msg: logs.append({"type": msg.type, "text": msg.text}))
         page.on("pageerror", lambda err: logs.append({"type": "error", "text": str(err)}))
-        await page.goto("file:///tmp/_app.html", wait_until="networkidle", timeout=15000)
+        await page.goto("file:///home/user/_app.html", wait_until="networkidle", timeout=15000)
         await page.wait_for_timeout(${waitMs})
         img = await page.screenshot(type="png", full_page=${fullPage ? "True" : "False"})
         print(json.dumps({"b64": base64.b64encode(img).decode(), "logs": logs[:50]}))
         await b.close()
 asyncio.run(main())
 `;
-      await sandbox.files.write("/tmp/_screenshot.py", script);
-      const result = await sandbox.commands.run("python3 /tmp/_screenshot.py", { timeout: 30 });
+      await sandbox.files.write("/home/user/_screenshot.py", script);
+      const result = await sandbox.commands.run("python3 /home/user/_screenshot.py", { timeout: 30 });
       if (result.exitCode !== 0) {
         return jsonResp(res, 500, { ok: false, error: "screenshot failed", stderr: result.stderr });
       }
@@ -183,7 +183,7 @@ asyncio.run(main())
 
       const sandbox = await getSandbox();
       await ensurePlaywright(sandbox);
-      await sandbox.files.write("/tmp/_app.html", html);
+      await sandbox.files.write("/home/user/_app.html", html);
 
       const interactionCode = interactions.map(i => {
         if (i.type === "click") return `    try: await page.click(${JSON.stringify(i.selector)}, timeout=2000)\n    except Exception as e: logs.append({"type":"interact_err","text": "click " + ${JSON.stringify(i.selector)} + ": " + str(e)})`;
@@ -202,7 +202,7 @@ async def main():
         logs = []
         page.on("console", lambda msg: logs.append({"type": msg.type, "text": msg.text[:500]}))
         page.on("pageerror", lambda err: logs.append({"type": "error", "text": str(err)[:500]}))
-        await page.goto("file:///tmp/_app.html", wait_until="networkidle", timeout=15000)
+        await page.goto("file:///home/user/_app.html", wait_until="networkidle", timeout=15000)
         await page.wait_for_timeout(${waitMs})
 ${interactionCode || "    pass"}
         body_text = await page.evaluate("document.body.innerText.slice(0, 2000)")
@@ -212,8 +212,8 @@ ${interactionCode || "    pass"}
         await b.close()
 asyncio.run(main())
 `;
-      await sandbox.files.write("/tmp/_console.py", script);
-      const result = await sandbox.commands.run("python3 /tmp/_console.py", { timeout: 45 });
+      await sandbox.files.write("/home/user/_console.py", script);
+      const result = await sandbox.commands.run("python3 /home/user/_console.py", { timeout: 45 });
       if (result.exitCode !== 0) {
         return jsonResp(res, 500, { ok: false, error: "console run failed", stderr: result.stderr });
       }
@@ -234,7 +234,7 @@ asyncio.run(main())
 
       const sandbox = await getSandbox();
       await ensurePlaywright(sandbox);
-      await sandbox.files.write("/tmp/_app.html", html);
+      await sandbox.files.write("/home/user/_app.html", html);
 
       const script = `
 import asyncio, json
@@ -245,7 +245,7 @@ async def main():
         b = await p.chromium.launch(args=["--no-sandbox"])
         page = await b.new_page()
         page.on("pageerror", lambda err: results.append({"type": "error", "text": str(err)[:500]}))
-        await page.goto("file:///tmp/_app.html", wait_until="networkidle", timeout=15000)
+        await page.goto("file:///home/user/_app.html", wait_until="networkidle", timeout=15000)
         try:
 ${testScript.split("\n").map(l => "            " + l).join("\n")}
             results.append({"type": "pass", "text": "all assertions passed"})
@@ -257,8 +257,8 @@ ${testScript.split("\n").map(l => "            " + l).join("\n")}
         await b.close()
 asyncio.run(main())
 `;
-      await sandbox.files.write("/tmp/_test.py", script);
-      const result = await sandbox.commands.run("python3 /tmp/_test.py", { timeout: 45 });
+      await sandbox.files.write("/home/user/_test.py", script);
+      const result = await sandbox.commands.run("python3 /home/user/_test.py", { timeout: 45 });
       try {
         const parsed = JSON.parse(result.stdout);
         const passed = parsed.results.every(r => r.type === "pass");
